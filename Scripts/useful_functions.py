@@ -37,7 +37,8 @@ def month_genesis_locs(year_desired,month_desired,basin_dataset,min_wspd):
     from calendar import monthrange
     from datetime import date as dt
     import numpy as np
-
+    year_desired = int(year_desired)
+    month_desired = int(month_desired)
     szn_DF = basin_dataset.get_season(year_desired).to_dataframe() # Get information of year
   
     # Set Minimum Wind Speed Requirement (THIS ONLY FILTERS WEAK STORMS!) Still need to find first time of a certain intensity!
@@ -93,7 +94,7 @@ def environmental_select_stack(month_range,year_range,Latitude,Longitude,arr):
     
     return stacked,NaNlocs
 
-def create_genesis_grid_labels(month_range,year_range,vmin,basin_dataset):
+def create_genesis_grid_labels(month_range,year_range,vmin,basin_dataset): # Need to move lat_ranges and lon_ranges out of function
     from useful_functions import month_genesis_locs
     from useful_functions import grid_counter
     import xarray as xr
@@ -107,7 +108,7 @@ def create_genesis_grid_labels(month_range,year_range,vmin,basin_dataset):
                 # Grid Counter
                 delta_degs = 2 # Size of boxes in degrees
                 lon_ranges = [-100,0] # Lon range to count (in the last value, add 10 to your desired value)
-                lat_ranges = [0,80] # Lat range to count (in the last value, add 10 to your desired value)
+                lat_ranges = [0,60] # Lat range to count (in the last value, add 10 to your desired value)
                 total_data_arr,longrid,latgrid = grid_counter(delta_degs,lon_ranges,lat_ranges,start_lons,start_lats) # Call grid_counter function
 
                 longridnew = longrid + 360 # WARNING: This only works for Atlantic Basin (need to modify if changing domain)
@@ -117,7 +118,7 @@ def create_genesis_grid_labels(month_range,year_range,vmin,basin_dataset):
 
             all_months_total_data_arr.append(single_year_data_arr)
 
-    labels = xr.DataArray(all_months_total_data_arr,coords=[("Month",month_range),("Year",year_range),("Latitude",latgrid),("Longitude",longridnew)])
+    labels = xr.DataArray(all_months_total_data_arr,coords=[("Month",month_range),("Year",year_range),("Latitude",latgrid.astype(float)),("Longitude",longridnew.astype(float))])
     labels_stack = labels.stack(z=("Month","Latitude","Longitude","Year"))
     
     return labels_stack
@@ -128,8 +129,7 @@ def take_closest_point(labels_predropped,NaNlocs,envstack,vars_list):
     import numpy as np
     from distance import pointdist_calc
 
-    
-    labels_tbd = labels_predropped.__xarray_dataarray_variable__[NaNlocs]
+    labels_tbd = labels_predropped.Genesis_Grids[NaNlocs]
     badgenlocs = np.where(labels_tbd > 0)[0]
     unstacklabels = labels_predropped.unstack()
 
@@ -143,7 +143,7 @@ def take_closest_point(labels_predropped,NaNlocs,envstack,vars_list):
         # Find location and distance of closest non NaN data point for all vars
         allcurrentbooleans = []
         for variablecheck in range(0,len(vars_list)):
-
+#            print(str(labels_predropped)+"LOOKHERE")
             currentdata_to_rect = envstack.sel(Month=float(current_tbd_label.coords['Month']),Year = float(current_tbd_label.coords['Year']),
                              Variable=vars_list[variablecheck])
 
@@ -168,12 +168,41 @@ def take_closest_point(labels_predropped,NaNlocs,envstack,vars_list):
 
         print(np.min(goodplaces['Distance']) < 300)
         if np.min(goodplaces['Distance']) < 300: # change closest point to yes
-            locinfo = labels_predropped.__xarray_dataarray_variable__.sel(Month=float(current_tbd_label.coords['Month']),Year = float(current_tbd_label.coords['Year']))[locused]
+            locinfo = labels_predropped.Genesis_Grids.sel(Month=float(current_tbd_label.coords['Month']),Year = float(current_tbd_label.coords['Year']))[locused]
             monthinfo = float(locinfo.Month)
             yearinfo = float(locinfo.Year)
             latinfo = float(locinfo.Latitude)
             loninfo = float(locinfo.Longitude)    
-            unstacklabels.__xarray_dataarray_variable__.loc[monthinfo,latinfo,loninfo,yearinfo] = unstacklabels.__xarray_dataarray_variable__.loc[monthinfo,latinfo,loninfo,yearinfo] + float(current_tbd_label)
+            unstacklabels.Genesis_Grids.loc[monthinfo,latinfo,loninfo,yearinfo] = unstacklabels.Genesis_Grids.loc[monthinfo,latinfo,loninfo,yearinfo] + float(current_tbd_label)
             counter = counter + 1
             print('action performed #' + str(counter))
     return unstacklabels
+
+# Spatial and Temporal Smoothing
+
+# Temporal smoothing
+def temporal_spatial_smoothing(data_array,temporal_sigma,spatial_sigma): # Data Array needs to be as type float!
+    from itertools import product
+    import xarray as xr
+    import copy
+    from scipy.ndimage import gaussian_filter
+
+    for i, j in product(range(data_array.shape[1]),range(data_array.shape[2])): # Loop over each grid cell
+        stacked_grid = data_array[:,i,j,:].stack(z=("Year", "Month")).astype(float) # Stack all times for a single grid cell
+        temporally_filtered_grid = gaussian_filter(stacked_grid,sigma=temporal_sigma,mode='wrap') # Filter a single grid cell over time
+        unstacked_smoothed_grid = xr.DataArray(temporally_filtered_grid,coords=stacked_grid.coords).unstack() # Put filtered data into XR
+        # Assign smoothed grid cell data to training data array
+        data_array[:,i,j,:] = copy.deepcopy(unstacked_smoothed_grid.transpose()) # Deep copy the unstacked so that it is not referencing
+
+    # Spatial smoothing    
+    spatially_filtered_grid = [] # List to store the array of each month
+    stack_for_spatial = data_array.stack(z=("Year", "Month")) # Stack for easier looping
+
+    for spatial_iter in range(stack_for_spatial.shape[2]): # Loop 2D array over all times
+        spatially_filtered_grid_indiv = gaussian_filter(stack_for_spatial[:,:,spatial_iter],sigma=spatial_sigma,mode='wrap') # Filter the 2D array spatially
+        spatially_filtered_grid.append(spatially_filtered_grid_indiv) # Save 2D array to list
+
+    # Convert from list to XR
+    spatially_temporally_filtered_XR = xr.DataArray(spatially_filtered_grid,coords = [stack_for_spatial.coords['z'],
+                                                   stack_for_spatial.coords['Latitude'],stack_for_spatial.coords['Longitude']]).unstack()
+    return spatially_temporally_filtered_XR
